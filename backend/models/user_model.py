@@ -14,6 +14,7 @@ from backend.core.database import Base
 
 if TYPE_CHECKING:
     from backend.models.user_roadmap_progress import UserRoadmapProgress
+    from backend.models.document_view_model import DocumentView
 
 
 class User(Base):
@@ -47,5 +48,8 @@ class User(Base):
     )
 
     roadmap_progress: Mapped[list[UserRoadmapProgress]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    document_views: Mapped[list["DocumentView"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )

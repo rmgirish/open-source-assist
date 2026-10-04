@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
   BookMarked,
+  BookOpen,
   BookOpenCheck,
   ExternalLink,
   GitCommit,
@@ -26,10 +27,13 @@ import {
   EmptyState,
   Input,
 } from '@/components/ui'
+import { DocumentReader } from '@/components/shared/DocumentReader'
 import {
   fetchDocuments,
+  fetchRecommendations,
   type DocCategory,
   type DocumentItem,
+  type RecommendationItem,
 } from '@/lib/docs-api'
 import { useAuthStore } from '@/lib/auth-store'
 import { cn } from '@/lib/utils'
@@ -55,6 +59,9 @@ export function DocsSection() {
   const [totalCount, setTotalCount] = useState<number>(0)
   const [userSkillLevel, setUserSkillLevel] = useState<string | null>(null)
   const [isPersonalized, setIsPersonalized] = useState<boolean>(false)
+  const [recommendations, setRecommendations] = useState<RecommendationItem[]>([])
+  const [recBasis, setRecBasis] = useState<string>('none')
+  const [readerDocId, setReaderDocId] = useState<string | null>(null)
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -88,6 +95,23 @@ export function DocsSection() {
   useEffect(() => {
     void loadDocs(category, query)
   }, [category, loadDocs, query])
+
+  // Personalized recommendations: reading history + skill level aware.
+  // Reloaded after the reader closes so freshly-read docs shape the picks.
+  const loadRecommendations = useCallback(async () => {
+    try {
+      const data = await fetchRecommendations(4, token ?? undefined)
+      setRecommendations(data.items)
+      setRecBasis(data.basis)
+    } catch {
+      // Recommendations are additive; the catalog works without them.
+      setRecommendations([])
+    }
+  }, [token])
+
+  useEffect(() => {
+    void loadRecommendations()
+  }, [loadRecommendations, readerDocId])
 
   const clearAll = () => {
     setQuery('')
@@ -130,6 +154,49 @@ export function DocsSection() {
             Resources and guides tailored to your assessed knowledge and focus are prioritized with recommendation badges.
           </div>
         </div>
+      )}
+
+      {/* Personalized Recommendations */}
+      {recommendations.length > 0 && (
+        <section aria-label="Recommended documentation">
+          <div className="mb-2.5 flex items-center gap-2">
+            <Sparkles className="size-3.5 text-accent-text" aria-hidden="true" />
+            <h2 className="font-mono text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Recommended for you
+            </h2>
+            {recBasis === 'reading_history' && (
+              <Badge variant="outline" className="text-[10px]">based on your reading</Badge>
+            )}
+            {recBasis === 'skill_level' && (
+              <Badge variant="outline" className="text-[10px]">matches your level</Badge>
+            )}
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            {recommendations.map((rec) => {
+              const RecIcon = CATEGORY_ICON_MAP[rec.document.category] ?? BookMarked
+              return (
+                <button
+                  key={rec.document.id}
+                  type="button"
+                  onClick={() => setReaderDocId(rec.document.id)}
+                  className="group rounded-lg border border-accent/25 bg-accent/5 p-3.5 text-left transition-all hover:-translate-y-0.5 hover:border-accent hover:shadow-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="flex size-7 shrink-0 items-center justify-center rounded-md border border-accent/30 bg-accent/10">
+                      <RecIcon className="size-3.5 text-accent-text" aria-hidden="true" />
+                    </span>
+                    <p className="truncate text-xs font-semibold group-hover:text-accent-text">
+                      {rec.document.title}
+                    </p>
+                  </div>
+                  <p className="mt-2 line-clamp-2 text-[11px] leading-relaxed text-muted-foreground">
+                    {rec.reason}
+                  </p>
+                </button>
+              )
+            })}
+          </div>
+        </section>
       )}
 
       {/* Search & Filters */}
@@ -284,13 +351,14 @@ export function DocsSection() {
             const CatIcon = CATEGORY_ICON_MAP[doc.category] ?? BookMarked
             const catObj = categories.find((c) => c.id === doc.category)
             return (
-              <a
-                key={doc.url}
-                href={doc.url}
-                target="_blank"
-                rel="noopener noreferrer"
+              <button
+                key={doc.id}
+                type="button"
+                onClick={() =>
+                  doc.has_full_text ? setReaderDocId(doc.id) : window.open(doc.url, '_blank', 'noopener,noreferrer')
+                }
                 className={cn(
-                  'group block rounded-lg border p-4 transition-all hover:-translate-y-0.5 hover:shadow-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:p-5',
+                  'group block rounded-lg border p-4 text-left transition-all hover:-translate-y-0.5 hover:shadow-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:p-5',
                   doc.is_recommended
                     ? 'border-accent/40 bg-accent/5 hover:border-accent'
                     : 'border-border bg-background hover:border-accent/50',
@@ -317,10 +385,17 @@ export function DocsSection() {
                       </p>
                     </div>
                   </div>
-                  <ExternalLink
-                    className="size-4 shrink-0 text-muted-foreground transition-colors group-hover:text-accent-text"
-                    aria-hidden="true"
-                  />
+                  {doc.has_full_text ? (
+                    <span className="flex shrink-0 items-center gap-1 rounded-md border border-accent/30 bg-accent/10 px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-accent-text">
+                      <BookOpen className="size-2.5" aria-hidden="true" />
+                      Read in-app
+                    </span>
+                  ) : (
+                    <ExternalLink
+                      className="size-4 shrink-0 text-muted-foreground transition-colors group-hover:text-accent-text"
+                      aria-hidden="true"
+                    />
+                  )}
                 </div>
 
                 <p className="mt-3 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
@@ -352,11 +427,14 @@ export function DocsSection() {
                     </Badge>
                   ))}
                 </div>
-              </a>
+              </button>
             )
           })}
         </div>
       )}
+
+      {/* Full-document reader modal */}
+      <DocumentReader docId={readerDocId} onClose={() => setReaderDocId(null)} />
     </div>
   )
 }

@@ -1,13 +1,23 @@
 """Service layer for official documentation catalog and user-tailored recommendation."""
 
 import re
+import uuid
 from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.models.document_view_model import DocumentView
 from backend.schemas.docs import (
     DocCategoryResponse,
     DocDifficulty,
     DocsCatalogResponse,
+    DocumentDetailResponse,
     DocumentItemResponse,
+    RecommendationListResponse,
+    RecommendationResponse,
 )
+from backend.services.doc_content import DOCUMENT_CONTENT
 
 RAW_CATEGORIES: list[dict[str, str]] = [
     {"id": "getting-started", "label": "Getting Started", "description": "Foundations for open source and GitHub newcomers."},
@@ -492,6 +502,29 @@ class DocService:
     def get_categories(self) -> list[DocCategoryResponse]:
         return [DocCategoryResponse(**cat) for cat in RAW_CATEGORIES]
 
+    def get_document_detail(self, doc_id: str) -> DocumentDetailResponse | None:
+        """Return one document with its full in-app readable content, if available."""
+        raw_doc = next((d for d in RAW_DOCUMENTS if d["id"] == doc_id), None)
+        if raw_doc is None:
+            return None
+        content = DOCUMENT_CONTENT.get(doc_id)
+        if content is None:
+            return None
+        return DocumentDetailResponse(
+            id=raw_doc["id"],
+            title=raw_doc["title"],
+            description=raw_doc["description"],
+            url=raw_doc["url"],
+            category=raw_doc["category"],
+            source=raw_doc["source"],
+            tags=raw_doc["tags"],
+            target_skill_level=raw_doc["target_skill_level"],
+            is_recommended=False,
+            recommendation_reason=None,
+            has_full_text=True,
+            content=content,
+        )
+
     def get_documents(
         self,
         category: str | None = None,
@@ -586,6 +619,7 @@ class DocService:
                     target_skill_level=raw_doc["target_skill_level"],
                     is_recommended=is_rec,
                     recommendation_reason=rec_reason,
+                    has_full_text=raw_doc["id"] in DOCUMENT_CONTENT,
                 )
             )
 
@@ -596,6 +630,128 @@ class DocService:
             user_skill_level=normalized_level or None,
             user_context=user_context or None,
             is_personalized=bool(normalized_level or user_context),
+        )
+
+
+    async def get_recommendations(
+        self,
+        db: AsyncSession,
+        user_id: str | None = None,
+        user_skill_level: str | None = None,
+        user_context: str | None = None,
+        limit: int = 6,
+    ) -> RecommendationListResponse:
+        """Top personalized documentation picks for a user.
+
+        Ranking combines, in order of weight:
+        1. Reading history — docs related to what the user actually read.
+        2. Assessed skill level — docs targeting the user's level.
+        3. Technical context keywords from the user's assessment.
+        Guests receive the same-weighted catalog so the UI always has picks.
+        """
+        normalized_level = (user_skill_level or "").strip().lower()
+        context_keywords: set[str] = set()
+        if user_context:
+            context_keywords = {
+                _normalize(w) for w in user_context.split() if len(w) > 3
+            }
+
+        # 1. Load the user's reading history (most-viewed doc ids).
+        history: list[tuple[str, int]] = []
+        if user_id:
+            try:
+                rows = await db.execute(
+                    select(DocumentView.doc_id, DocumentView.view_count)
+                    .where(DocumentView.user_id == uuid.UUID(user_id))
+                    .order_by(DocumentView.last_viewed_at.desc())
+                    .limit(10)
+                )
+                history = [(doc_id, count) for doc_id, count in rows.all()]
+            except (ValueError, TypeError):
+                history = []
+
+        history_ids = {doc_id for doc_id, _ in history}
+        related_tags: set[str] = set()
+        for doc_id, view_count in history:
+            source_doc = next((d for d in RAW_DOCUMENTS if d["id"] == doc_id), None)
+            if source_doc:
+                related_tags.update(_normalize(t) for t in source_doc["tags"])
+
+        basis = "none"
+        scored: list[tuple[float, dict[str, Any], str]] = []
+
+        for doc in RAW_DOCUMENTS:
+            if doc["id"] in history_ids:
+                continue  # never recommend what the user just read
+
+            score = 0.0
+            reasons: list[str] = []
+            doc_level = doc["target_skill_level"].value
+            doc_tags = [_normalize(t) for t in doc["tags"]]
+
+            # Reading-history affinity: shared tags with read docs.
+            if history:
+                shared = [t for t in doc_tags if t in related_tags]
+                if shared:
+                    score += 18.0 * len(shared)
+                    reasons.append(f"Because you read docs about {', '.join(shared)}")
+
+            if normalized_level:
+                if doc_level == normalized_level:
+                    score += 14.0
+                    reasons.append(f"Matches your assessed {normalized_level} skill level")
+                elif doc_level == "all":
+                    score += 5.0
+
+            if context_keywords:
+                matched = [t for t in doc_tags if t in context_keywords]
+                if matched:
+                    score += 12.0 * len(matched)
+                    reasons.append(f"Aligns with your background in {', '.join(matched)}")
+
+            # Guests / new users: featured evergreen picks so the list is useful.
+            if not history and not normalized_level and not context_keywords:
+                if doc_level == "all" and "official" in doc_tags:
+                    score += 10.0
+                    reasons.append("Official starting point")
+                if doc_level == "beginner":
+                    score += 6.0
+                    reasons.append("Great first read")
+
+            if reasons:
+                scored.append((score, doc, "; ".join(reasons)))
+                basis = "reading_history" if history else (
+                    "skill_level" if (normalized_level or context_keywords) else "default"
+                )
+
+        scored.sort(key=lambda x: (-x[0], x[1]["id"]))
+
+        items = [
+            RecommendationResponse(
+                document=DocumentItemResponse(
+                    id=doc["id"],
+                    title=doc["title"],
+                    description=doc["description"],
+                    url=doc["url"],
+                    category=doc["category"],
+                    source=doc["source"],
+                    tags=doc["tags"],
+                    target_skill_level=doc["target_skill_level"],
+                    is_recommended=True,
+                    recommendation_reason=reason,
+                    has_full_text=doc["id"] in DOCUMENT_CONTENT,
+                ),
+                reason=reason,
+                score=round(score, 2),
+            )
+            for score, doc, reason in scored[:limit]
+        ]
+
+        return RecommendationListResponse(
+            items=items,
+            user_skill_level=normalized_level or None,
+            user_context=user_context or None,
+            basis=basis,
         )
 
 

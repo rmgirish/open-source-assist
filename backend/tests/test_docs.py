@@ -1,9 +1,54 @@
 """Unit tests for Documentation Hub backend endpoints and personalized ranking."""
 
+import uuid
+
 import pytest
+import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
+
+from backend.core.database import Base, get_db
+from backend.core.jwt import create_access_token
+from backend.core.security import hash_password
 from backend.main import app
+from backend.models.user_model import User
 from backend.services.doc_service import doc_service
+
+
+@pytest_asyncio.fixture
+async def docs_db():
+    """SQLite test DB with one verified user for view-tracking tests."""
+    engine = create_async_engine(
+        "sqlite+aiosqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    session = session_factory()
+    user = User(
+        id=uuid.uuid4(),
+        email="reader@example.com",
+        username="reader",
+        password_hash=hash_password("password-123"),
+        skill_level="beginner",
+        role="user",
+        account_status="active",
+        is_active=True,
+    )
+    session.add(user)
+    await session.commit()
+
+    async def override_get_db():
+        yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+    yield session, user
+    app.dependency_overrides.clear()
+    await session.close()
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -90,3 +135,111 @@ async def test_api_docs_categories_endpoint() -> None:
         data = response.json()
         assert isinstance(data, list)
         assert len(data) == 9
+
+
+@pytest.mark.asyncio
+async def test_api_docs_detail_full_text() -> None:
+    """Test GET /api/v1/docs/{id} returns full markdown content."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        response = await ac.get("/api/v1/docs/about-pull-requests")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == "about-pull-requests"
+        assert data["has_full_text"] is True
+        assert "pull request" in data["content"].lower()
+        assert len(data["content"]) > 500
+
+
+@pytest.mark.asyncio
+async def test_api_docs_detail_not_found() -> None:
+    """Test GET /api/v1/docs/{id} returns 404 for unknown ids."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        response = await ac.get("/api/v1/docs/does-not-exist")
+        assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_api_docs_recommendations_guest_default() -> None:
+    """Guests get evergreen default picks with a usable reason."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        response = await ac.get("/api/v1/docs/recommendations")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["items"]) > 0
+        assert data["basis"] == "default"
+        first = data["items"][0]
+        assert first["reason"]
+        assert first["document"]["is_recommended"] is True
+
+
+@pytest.mark.asyncio
+async def test_api_docs_recommendations_personalized(docs_db) -> None:
+    """Authenticated user with a skill level gets skill-based ranking."""
+    _session, user = docs_db
+    token = create_access_token(str(user.id))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        response = await ac.get(
+            "/api/v1/docs/recommendations",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["user_skill_level"] == "beginner"
+        assert data["basis"] == "skill_level"
+        assert len(data["items"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_api_docs_view_tracking_and_history_ranking(docs_db) -> None:
+    """View tracking upserts and reading history drives recommendations."""
+    _session, user = docs_db
+    token = create_access_token(str(user.id))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        # Record one view twice.
+        for _ in range(2):
+            resp = await ac.post(
+                "/api/v1/docs/learn-git-branching/view",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+            assert resp.json() == {"recorded": True}
+
+        # Recommendations should now be history-driven and exclude the read doc.
+        resp = await ac.get(
+            "/api/v1/docs/recommendations",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["basis"] == "reading_history"
+        rec_ids = [item["document"]["id"] for item in data["items"]]
+        assert "learn-git-branching" not in rec_ids
+        assert len(rec_ids) > 0
+
+        # Second view should have incremented view_count, not created a new row.
+        from sqlalchemy import select
+
+        from backend.models.document_view_model import DocumentView
+
+        rows = (await _session.execute(select(DocumentView))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].view_count == 2
+
+
+@pytest.mark.asyncio
+async def test_api_docs_view_unknown_doc_404(docs_db) -> None:
+    """Recording a view for an unknown document id returns 404."""
+    _session, user = docs_db
+    token = create_access_token(str(user.id))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        response = await ac.post(
+            "/api/v1/docs/no-such-doc/view",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 404

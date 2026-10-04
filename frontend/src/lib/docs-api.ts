@@ -19,6 +19,24 @@ export interface DocumentItem {
   target_skill_level: 'beginner' | 'intermediate' | 'advanced' | 'all'
   is_recommended: boolean
   recommendation_reason?: string | null
+  has_full_text?: boolean
+}
+
+export interface DocumentDetail extends DocumentItem {
+  content: string
+}
+
+export interface RecommendationItem {
+  document: DocumentItem
+  reason: string
+  score: number
+}
+
+export interface RecommendationsResponse {
+  items: RecommendationItem[]
+  user_skill_level?: string | null
+  user_context?: string | null
+  basis: 'reading_history' | 'skill_level' | 'default' | 'none'
 }
 
 export interface DocsCatalogResponse {
@@ -66,13 +84,72 @@ export async function fetchDocuments(
   })
 
   if (!response.ok) {
-    const errorBody = await response.json().catch(() => null)
-    const message =
-      typeof errorBody?.detail === 'string'
-        ? errorBody.detail
-        : `Failed to fetch documentation (${response.status})`
-    throw new Error(message)
+    throw new Error(await extractApiError(response, 'Failed to fetch documentation'))
   }
 
   return response.json() as Promise<DocsCatalogResponse>
+}
+
+/**
+ * Fetch one full document (complete markdown content) for in-app reading.
+ */
+export async function fetchDocumentDetail(
+  docId: string,
+): Promise<DocumentDetail> {
+  const response = await fetch(`/api/v1/docs/${encodeURIComponent(docId)}`, {
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json' },
+  })
+
+  if (!response.ok) {
+    throw new Error(await extractApiError(response, 'Failed to load document'))
+  }
+
+  return response.json() as Promise<DocumentDetail>
+}
+
+/**
+ * Fetch personalized recommendations (reading history + skill level aware).
+ */
+export async function fetchRecommendations(
+  limit = 6,
+  token?: string,
+): Promise<RecommendationsResponse> {
+  const response = await fetch(`/api/v1/docs/recommendations?limit=${limit}`, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+  })
+
+  if (!response.ok) {
+    throw new Error(await extractApiError(response, 'Failed to fetch recommendations'))
+  }
+
+  return response.json() as Promise<RecommendationsResponse>
+}
+
+/**
+ * Record that the signed-in user opened a document (fire-and-forget).
+ */
+export async function recordDocumentView(docId: string, token?: string): Promise<void> {
+  try {
+    await fetch(`/api/v1/docs/${encodeURIComponent(docId)}/view`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    })
+  } catch {
+    // View tracking is best-effort; never block reading.
+  }
+}
+
+async function extractApiError(response: Response, fallback: string): Promise<string> {
+  const errorBody = await response.json().catch(() => null)
+  return typeof errorBody?.detail === 'string'
+    ? errorBody.detail
+    : `${fallback} (${response.status})`
 }

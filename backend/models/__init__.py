@@ -4,6 +4,7 @@ from backend.models.otp_model import OTP, OTPPurpose
 from backend.models.user_model import User
 from backend.models.project import Project
 from backend.models.contributor import Contributor
+from backend.models.document_view_model import DocumentView
 from backend.models.event_model import Event
 from backend.models.roadmap import Roadmap
 from backend.models.roadmap_step import RoadmapStep
@@ -16,6 +17,7 @@ __all__ = [
     "User",
     "Project",
     "Contributor",
+    "DocumentView",
     "Event",
     "Roadmap",
     "RoadmapStep",

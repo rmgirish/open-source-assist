@@ -318,3 +318,65 @@ This document tracks all FastAPI endpoint contracts, request payloads, and respo
 
 
 
+## [v0.5.0] - 2026-10-04: Documentation Hub — Full Documents & Personalized Recommendations
+
+### 12. Fetch Full Document Content
+* **Endpoint**: `GET /api/v1/docs/{doc_id}`
+* **Status**: `200 OK` / `404 Not Found`
+* **Description**: Returns the complete, self-contained markdown content of one documentation item so it can be read entirely in-app. Content covers the actual Git, GitHub, and open source guides (GitHub Docs, Pro Git chapters, opensource.guide, program guides, licensing).
+* **Response Body** (`DocumentDetailResponse`):
+  ```json
+  {
+    "id": "about-pull-requests",
+    "title": "About Pull Requests",
+    "description": "The core concept explained: what a PR is, how review and merge work.",
+    "url": "https://docs.github.com/en/...",
+    "category": "pull-requests",
+    "source": "GitHub",
+    "tags": ["pr", "review", "merge", "core-concept"],
+    "target_skill_level": "beginner",
+    "is_recommended": false,
+    "recommendation_reason": null,
+    "has_full_text": true,
+    "content": "## Overview\n\nA pull request is ... (full markdown document)"
+  }
+  ```
+* **Errors**: `404` when `doc_id` is unknown or the document has no in-app full text.
+
+### 13. Personalized Documentation Recommendations
+* **Endpoint**: `GET /api/v1/docs/recommendations?limit=6`
+* **Status**: `200 OK`
+* **Description**: Ranks documentation for the signed-in user from (1) reading history recorded via `POST /docs/{doc_id}/view`, (2) assessed skill level, and (3) technical context from the skill assessment. Guests receive evergreen featured picks. Already-read documents are excluded.
+* **Headers**:
+  * `Authorization: Bearer <token>` (Optional)
+* **Response Body** (`RecommendationListResponse`):
+  ```json
+  {
+    "items": [
+      {
+        "document": { "id": "pro-git-book", "title": "Pro Git — The Book", "...": "..." },
+        "reason": "Because you read docs about branching; Matches your assessed intermediate skill level",
+        "score": 32.0
+      }
+    ],
+    "user_skill_level": "intermediate",
+    "user_context": "Experienced in Python microservices",
+    "basis": "reading_history"
+  }
+  ```
+* `basis` is one of `reading_history`, `skill_level`, `default` (guest picks), `none`.
+
+### 14. Record Document View (Reading History)
+* **Endpoint**: `POST /api/v1/docs/{doc_id}/view`
+* **Status**: `200 OK` / `404 Not Found`
+* **Description**: Upserts one row per user per document in the `document_views` table (`view_count` increments on repeat reads). Feeds the recommendation ranking. Guests receive `{"recorded": false, "reason": "guest"}` and nothing is stored.
+* **Headers**:
+  * `Authorization: Bearer <token>` (Optional)
+* **Response Body**:
+  ```json
+  { "recorded": true }
+  ```
+
+### Catalog changes (v0.5.0)
+* `GET /api/v1/docs` items now include `has_full_text: bool` — `true` when the document can be read in-app via `GET /docs/{doc_id}`.
+* New table `document_views` (user_id, doc_id, view_count, first/last_viewed_at) created automatically by `init_db`.
